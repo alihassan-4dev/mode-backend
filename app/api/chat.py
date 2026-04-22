@@ -51,9 +51,11 @@ async def create_chat_message(
         if payload.session_id:
             session = await chat_store.get_session(db, user_id=user.id, session_id=payload.session_id)
             if session is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Chat session not found.",
+                session = await chat_store.create_session(
+                    db,
+                    user_id=user.id,
+                    title=_build_title(payload.message),
+                    session_id=payload.session_id,
                 )
         if session is None:
             session = await chat_store.create_session(db, user_id=user.id, title=_build_title(payload.message))

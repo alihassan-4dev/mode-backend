@@ -76,7 +76,7 @@ def _fallback_response(message: str) -> str:
             "and message someone you trust if you need support."
         )
     return (
-        "I’m here with you. Tell me what feels hardest right now, or ask about your dashboard and "
+        "I'm here with you. Tell me what feels hardest right now, or ask about your dashboard and "
         "connected platforms if you want a quick status check."
     )
 

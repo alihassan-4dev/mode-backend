@@ -77,11 +77,12 @@ async def create_session(
     *,
     user_id: str,
     title: str,
+    session_id: str | None = None,
 ) -> ChatSession | MemoryChatSession:
     if not _use_persistent_storage():
         now = datetime.now(timezone.utc)
         session = MemoryChatSession(
-            id=str(uuid.uuid4()),
+            id=session_id or str(uuid.uuid4()),
             user_id=user_id,
             title=title,
             created_at=now,
@@ -89,7 +90,7 @@ async def create_session(
         )
         _get_user_sessions(user_id)[session.id] = session
         return session
-    session = ChatSession(user_id=user_id, title=title)
+    session = ChatSession(id=session_id or str(uuid.uuid4()), user_id=user_id, title=title)
     db.add(session)
     await db.flush()
     await db.refresh(session)

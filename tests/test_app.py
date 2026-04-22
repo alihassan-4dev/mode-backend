@@ -94,6 +94,47 @@ async def test_auth_dashboard_and_chat_flow(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_chat_reuses_client_provided_session_uuid(client: AsyncClient):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "session@example.com",
+            "password": "strongpass123",
+            "full_name": "Session Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    access_token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+    session_id = "4d6a2b55-4d08-4108-a521-0d6cbcf4a4cf"
+
+    first_message_response = await client.post(
+        "/api/chat/message",
+        headers=headers,
+        json={
+            "message": "Start a new focused chat for me.",
+            "session_id": session_id,
+        },
+    )
+    assert first_message_response.status_code == 200
+    first_payload = first_message_response.json()
+    assert first_payload["session"]["id"] == session_id
+
+    second_message_response = await client.post(
+        "/api/chat/message",
+        headers=headers,
+        json={
+            "message": "Continue the same chat.",
+            "session_id": session_id,
+        },
+    )
+    assert second_message_response.status_code == 200
+    second_payload = second_message_response.json()
+    assert second_payload["session"]["id"] == session_id
+    assert len(second_payload["session"]["messages"]) == 4
+
+
+@pytest.mark.asyncio
 async def test_integration_authorize_requires_and_uses_meta_config(client: AsyncClient, test_env, monkeypatch: pytest.MonkeyPatch):
     login_response = await client.post(
         "/api/auth/register",

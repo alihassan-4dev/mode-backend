@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from threading import RLock
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.config import get_settings
+from app.models.chat import ChatMessage, ChatSession
+
+
+@dataclass
+class MemoryChatMessage:
+    id: str
+    role: str
+    content: str
+    created_at: datetime
+
+
+@dataclass
+class MemoryChatSession:
+    id: str
+    user_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    messages: list[MemoryChatMessage] = field(default_factory=list)
+
+
+_memory_lock = RLock()
+_memory_sessions_by_user: dict[str, dict[str, MemoryChatSession]] = {}
+
+
+def _use_persistent_storage() -> bool:
+    return get_settings().uses_persistent_chat_history
+
+
+def _get_user_sessions(user_id: str) -> dict[str, MemoryChatSession]:
+    with _memory_lock:
+        return _memory_sessions_by_user.setdefault(user_id, {})
+
+
+async def list_sessions(db: AsyncSession, *, user_id: str) -> list[ChatSession | MemoryChatSession]:
+    if not _use_persistent_storage():
+        sessions = list(_get_user_sessions(user_id).values())
+        return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
+    result = await db.execute(
+        select(ChatSession)
+        .where(ChatSession.user_id == user_id)
+        .order_by(ChatSession.updated_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_session(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    session_id: str,
+) -> ChatSession | MemoryChatSession | None:
+    if not _use_persistent_storage():
+        return _get_user_sessions(user_id).get(session_id)
+    result = await db.execute(
+        select(ChatSession)
+        .options(selectinload(ChatSession.messages))
+        .where(ChatSession.id == session_id, ChatSession.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_session(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    title: str,
+) -> ChatSession | MemoryChatSession:
+    if not _use_persistent_storage():
+        now = datetime.now(timezone.utc)
+        session = MemoryChatSession(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            title=title,
+            created_at=now,
+            updated_at=now,
+        )
+        _get_user_sessions(user_id)[session.id] = session
+        return session
+    session = ChatSession(user_id=user_id, title=title)
+    db.add(session)
+    await db.flush()
+    await db.refresh(session)
+    return session
+
+
+async def add_message(
+    db: AsyncSession,
+    *,
+    session: ChatSession | MemoryChatSession,
+    role: str,
+    content: str,
+) -> ChatMessage | MemoryChatMessage:
+    if not _use_persistent_storage():
+        message = MemoryChatMessage(
+            id=str(uuid.uuid4()),
+            role=role,
+            content=content,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.updated_at = datetime.now(timezone.utc)
+        session.messages.append(message)
+        return message
+    message = ChatMessage(session_id=session.id, role=role, content=content)
+    session.updated_at = datetime.now(timezone.utc)
+    db.add(message)
+    await db.flush()
+    await db.refresh(message)
+    return message
+
+
+def reset_memory_store() -> None:
+    with _memory_lock:
+        _memory_sessions_by_user.clear()

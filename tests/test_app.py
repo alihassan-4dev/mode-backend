@@ -135,6 +135,44 @@ async def test_chat_reuses_client_provided_session_uuid(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_reports_missing_platform_as_zero(client: AsyncClient):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "dashboard@example.com",
+            "password": "strongpass123",
+            "full_name": "Dashboard Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    access_token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    from app.core.database import get_async_session_factory
+    from app.services import token_store
+
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+    async with sessionmaker() as db:
+        await token_store.upsert_connection(
+            db,
+            user_id=register_response.json()["user"]["id"],
+            platform="facebook",
+            platform_user_id="facebook-user-id",
+            access_token="token",
+            platform_name="Facebook Person",
+        )
+
+    dashboard_response = await client.get("/api/dashboard/summary", headers=headers)
+    assert dashboard_response.status_code == 200
+    platforms = {item["platform"]: item for item in dashboard_response.json()["platform_breakdown"]}
+    assert platforms["facebook"]["connected"] is True
+    assert platforms["facebook"]["activity_count"] == 1
+    assert platforms["instagram"]["connected"] is False
+    assert platforms["instagram"]["activity_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_integration_authorize_requires_and_uses_meta_config(client: AsyncClient, test_env, monkeypatch: pytest.MonkeyPatch):
     login_response = await client.post(
         "/api/auth/register",

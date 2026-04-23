@@ -56,6 +56,28 @@ async def list_sessions(db: AsyncSession, *, user_id: str) -> list[ChatSession |
     return list(result.scalars().all())
 
 
+async def list_recent_messages(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    limit: int = 50,
+) -> list[ChatMessage | MemoryChatMessage]:
+    if not _use_persistent_storage():
+        messages: list[MemoryChatMessage] = []
+        for session in _get_user_sessions(user_id).values():
+            messages.extend(session.messages)
+        return sorted(messages, key=lambda item: item.created_at, reverse=True)[:limit]
+
+    result = await db.execute(
+        select(ChatMessage)
+        .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+        .where(ChatSession.user_id == user_id)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def get_session(
     db: AsyncSession,
     *,

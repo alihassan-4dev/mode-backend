@@ -16,6 +16,8 @@ Routes:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -35,15 +37,21 @@ from app.schemas.integration import (
 from app.services import meta, token_store
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+IG_PENDING_OAUTH_TTL_SECONDS = 15 * 60
+_ig_pending_oauth_by_ip: dict[str, tuple[str, float, str]] = {}
 
 
-def _ensure_meta_configured() -> None:
+def _ensure_meta_configured(platform: str) -> None:
     settings = get_settings()
-    if settings.META_APP_ID and settings.META_APP_SECRET:
+    try:
+        meta.get_platform_app_credentials(platform, settings)
         return
+    except ValueError as exc:
+        detail = str(exc)
     raise HTTPException(
         status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Meta login is not configured yet. Set META_APP_ID and META_APP_SECRET.",
+        detail=detail,
     )
 
 
@@ -56,6 +64,11 @@ def _callback_url(request: Request, platform: str) -> str:
     API URL (e.g. ngrok) when Meta shows the insecure-connection error.
     """
     settings = get_settings()
+    if platform == "facebook" and settings.FACEBOOK_REDIRECT_URI.strip():
+        return settings.FACEBOOK_REDIRECT_URI.strip()
+    if platform == "instagram" and settings.INSTAGRAM_REDIRECT_URI.strip():
+        return settings.INSTAGRAM_REDIRECT_URI.strip()
+
     explicit = settings.PUBLIC_API_BASE_URL.strip()
     if explicit:
         base = explicit.rstrip("/")
@@ -82,12 +95,20 @@ async def list_connections(
 
 @router.get("/facebook/authorize", response_model=AuthorizeResponse)
 async def fb_authorize(request: Request, user: User = Depends(get_current_user)):
-    _ensure_meta_configured()
+    _ensure_meta_configured("facebook")
     settings = get_settings()
+    _, _, cred_source = meta.get_platform_app_credentials("facebook", settings)
+    callback = _callback_url(request, "facebook")
+    logger.info(
+        "Facebook OAuth authorize requested user_id=%s callback=%s cred_source=%s",
+        user.id,
+        callback,
+        cred_source,
+    )
     url = meta.build_fb_authorize_url(
         user_id=user.id,
         settings=settings,
-        callback_url=_callback_url(request, "facebook"),
+        callback_url=callback,
     )
     return AuthorizeResponse(url=url)
 
@@ -95,25 +116,45 @@ async def fb_authorize(request: Request, user: User = Depends(get_current_user))
 @router.get("/facebook/callback")
 async def fb_callback(
     request: Request,
-    code: Annotated[str, Query()],
-    state: Annotated[str, Query()],
+    code: Annotated[str | None, Query()] = None,
+    state: Annotated[str | None, Query()] = None,
+    error: Annotated[str | None, Query()] = None,
+    error_reason: Annotated[str | None, Query()] = None,
+    error_description: Annotated[str | None, Query()] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    _ensure_meta_configured()
+    _ensure_meta_configured("facebook")
     settings = get_settings()
     frontend = settings.FRONTEND_URL.rstrip("/")
+    callback = _callback_url(request, "facebook")
+
+    if error:
+        logger.warning(
+            "Facebook OAuth returned provider error error=%s reason=%s description=%s callback=%s",
+            error,
+            error_reason,
+            error_description,
+            callback,
+        )
+        return RedirectResponse(f"{frontend}/integrations?error=facebook_oauth_{error}")
+
+    if not code or not state:
+        logger.warning("Facebook callback missing required query params callback=%s", callback)
+        return RedirectResponse(f"{frontend}/integrations?error=missing_oauth_code_or_state")
 
     try:
         user_id = meta.verify_state(state, settings.META_STATE_SECRET)
     except ValueError as exc:
+        logger.warning("Facebook OAuth state verification failed: %s", exc)
         return RedirectResponse(f"{frontend}/integrations?error={exc}")
 
     try:
         access_token, expires_in = await meta.exchange_fb_code(
-            code, _callback_url(request, "facebook"), settings
+            code, callback, settings
         )
         profile = await meta.fetch_fb_profile(access_token)
     except Exception:
+        logger.exception("Facebook token exchange/profile fetch failed callback=%s", callback)
         return RedirectResponse(f"{frontend}/integrations?error=token_exchange_failed")
 
     picture_url = None
@@ -134,6 +175,7 @@ async def fb_callback(
         avatar_url=picture_url,
         raw_profile=profile,
     )
+    logger.info("Facebook connected user_id=%s fb_profile_id=%s", user_id, profile.get("id"))
     return RedirectResponse(f"{frontend}/integrations?connected=facebook")
 
 
@@ -185,38 +227,92 @@ async def fb_data(
 
 @router.get("/instagram/authorize", response_model=AuthorizeResponse)
 async def ig_authorize(request: Request, user: User = Depends(get_current_user)):
-    _ensure_meta_configured()
+    _ensure_meta_configured("instagram")
     settings = get_settings()
+    _, _, cred_source = meta.get_platform_app_credentials("instagram", settings)
+    callback = _callback_url(request, "instagram")
+    logger.info(
+        "Instagram OAuth authorize requested user_id=%s callback=%s cred_source=%s",
+        user.id,
+        callback,
+        cred_source,
+    )
+    if request.client and request.client.host:
+        _ig_pending_oauth_by_ip[request.client.host] = (user.id, time.time(), callback)
     url = meta.build_ig_authorize_url(
         user_id=user.id,
         settings=settings,
-        callback_url=_callback_url(request, "instagram"),
+        callback_url=callback,
     )
+    logger.info("Instagram OAuth authorize URL generated callback=%s", callback)
     return AuthorizeResponse(url=url)
 
 
 @router.get("/instagram/callback")
 async def ig_callback(
     request: Request,
-    code: Annotated[str, Query()],
-    state: Annotated[str, Query()],
+    code: Annotated[str | None, Query()] = None,
+    state: Annotated[str | None, Query()] = None,
+    error: Annotated[str | None, Query()] = None,
+    error_reason: Annotated[str | None, Query()] = None,
+    error_description: Annotated[str | None, Query()] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    _ensure_meta_configured()
+    _ensure_meta_configured("instagram")
     settings = get_settings()
     frontend = settings.FRONTEND_URL.rstrip("/")
+    callback = _callback_url(request, "instagram")
 
-    try:
-        user_id = meta.verify_state(state, settings.META_STATE_SECRET)
-    except ValueError as exc:
-        return RedirectResponse(f"{frontend}/integrations?error={exc}")
+    if error:
+        logger.warning(
+            "Instagram OAuth returned provider error error=%s reason=%s description=%s callback=%s",
+            error,
+            error_reason,
+            error_description,
+            callback,
+        )
+        return RedirectResponse(f"{frontend}/integrations?error=instagram_oauth_{error}")
+
+    if not code:
+        logger.warning("Instagram callback missing required query params callback=%s", callback)
+        return RedirectResponse(f"{frontend}/integrations?error=missing_oauth_code_or_state")
+
+    user_id: str | None = None
+    if state:
+        try:
+            user_id = meta.verify_state(state, settings.META_STATE_SECRET)
+        except ValueError as exc:
+            logger.warning("Instagram OAuth state verification failed: %s", exc)
+            return RedirectResponse(f"{frontend}/integrations?error={exc}")
+    else:
+        # Instagram Business Login can omit state on some callback flows.
+        # For local development, recover user from the most recent authorize call by IP.
+        ip = request.client.host if request.client else ""
+        pending = _ig_pending_oauth_by_ip.get(ip)
+        if pending:
+            pending_user_id, issued_at, pending_callback = pending
+            if (time.time() - issued_at) <= IG_PENDING_OAUTH_TTL_SECONDS and pending_callback == callback:
+                user_id = pending_user_id
+                logger.warning(
+                    "Instagram callback missing state; using pending OAuth session fallback ip=%s user_id=%s",
+                    ip,
+                    user_id,
+                )
+        if not user_id:
+            logger.warning(
+                "Instagram callback missing state and no valid pending session callback=%s ip=%s",
+                callback,
+                ip,
+            )
+            return RedirectResponse(f"{frontend}/integrations?error=missing_oauth_code_or_state")
 
     try:
         access_token, expires_in = await meta.exchange_ig_code(
-            code, _callback_url(request, "instagram"), settings
+            code, callback, settings
         )
         profile = await meta.fetch_ig_profile(access_token)
     except Exception:
+        logger.exception("Instagram token exchange/profile fetch failed callback=%s", callback)
         return RedirectResponse(f"{frontend}/integrations?error=token_exchange_failed")
 
     await token_store.upsert_connection(
@@ -232,6 +328,9 @@ async def ig_callback(
         avatar_url=None,
         raw_profile=profile,
     )
+    if request.client and request.client.host:
+        _ig_pending_oauth_by_ip.pop(request.client.host, None)
+    logger.info("Instagram connected user_id=%s ig_profile_id=%s", user_id, profile.get("id"))
     return RedirectResponse(f"{frontend}/integrations?connected=instagram")
 
 

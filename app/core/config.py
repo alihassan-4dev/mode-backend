@@ -28,9 +28,16 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:8080"
     # If set, OAuth redirect_uri uses this base (HTTPS tunnel URL in dev). Meta rejects plain http:// except localhost.
     PUBLIC_API_BASE_URL: str = ""
+    # Optional explicit redirect URI overrides (recommended for production stability).
+    FACEBOOK_REDIRECT_URI: str = ""
+    INSTAGRAM_REDIRECT_URI: str = ""
 
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
+    FB_APP_ID: str = ""
+    FB_APP_SECRET: str = ""
+    IG_APP_ID: str = ""
+    IG_APP_SECRET: str = ""
     META_STATE_SECRET: str = "change-me-to-a-random-32-char-string"
     GROQ_API_KEY: str = ""
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"

@@ -17,6 +17,10 @@ def test_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("GROQ_API_KEY", "")
     monkeypatch.setenv("META_APP_ID", "")
     monkeypatch.setenv("META_APP_SECRET", "")
+    monkeypatch.setenv("FB_APP_ID", "")
+    monkeypatch.setenv("FB_APP_SECRET", "")
+    monkeypatch.setenv("IG_APP_ID", "")
+    monkeypatch.setenv("IG_APP_SECRET", "")
     monkeypatch.setenv("META_STATE_SECRET", "test-meta-state-secret")
 
     from app.core.config import get_settings
@@ -188,7 +192,7 @@ async def test_integration_authorize_requires_and_uses_meta_config(client: Async
 
     missing_config_response = await client.get("/api/integrations/facebook/authorize", headers=headers)
     assert missing_config_response.status_code == 503
-    assert missing_config_response.json()["detail"] == "Meta login is not configured yet. Set META_APP_ID and META_APP_SECRET."
+    assert "Facebook login is not configured yet." in missing_config_response.json()["detail"]
 
     monkeypatch.setenv("META_APP_ID", "meta-app-id")
     monkeypatch.setenv("META_APP_SECRET", "meta-app-secret")
@@ -203,5 +207,93 @@ async def test_integration_authorize_requires_and_uses_meta_config(client: Async
 
     instagram_response = await client.get("/api/integrations/instagram/authorize", headers=headers)
     assert instagram_response.status_code == 200
-    assert "api.instagram.com" in instagram_response.json()["url"]
+    assert "instagram.com/oauth/authorize" in instagram_response.json()["url"]
     assert "client_id=meta-app-id" in instagram_response.json()["url"]
+    assert "instagram_business_basic" in instagram_response.json()["url"]
+
+    monkeypatch.setenv("IG_APP_ID", "ig-app-id")
+    monkeypatch.setenv("IG_APP_SECRET", "ig-app-secret")
+    monkeypatch.setenv("INSTAGRAM_REDIRECT_URI", "https://api.example.com/api/integrations/instagram/callback")
+    get_settings.cache_clear()
+
+    instagram_response_with_specific_creds = await client.get("/api/integrations/instagram/authorize", headers=headers)
+    assert instagram_response_with_specific_creds.status_code == 200
+    assert "client_id=ig-app-id" in instagram_response_with_specific_creds.json()["url"]
+    assert "instagram.com/oauth/authorize" in instagram_response_with_specific_creds.json()["url"]
+    assert "redirect_uri=https%3A%2F%2Fapi.example.com%2Fapi%2Fintegrations%2Finstagram%2Fcallback" in instagram_response_with_specific_creds.json()["url"]
+
+
+@pytest.mark.asyncio
+async def test_instagram_callback_provider_error_redirects_cleanly(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "igerror@example.com",
+            "password": "strongpass123",
+            "full_name": "IG Error Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    access_token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    monkeypatch.setenv("META_APP_ID", "meta-app-id")
+    monkeypatch.setenv("META_APP_SECRET", "meta-app-secret")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+
+    response = await client.get(
+        "/api/integrations/instagram/callback"
+        "?error=invalid_request"
+        "&error_reason=user_denied"
+        "&error_description=Invalid%20platform%20app",
+        headers=headers,
+    )
+    assert response.status_code in (302, 307)
+    assert "integrations?error=instagram_oauth_invalid_request" in response.headers.get("location", "")
+
+
+@pytest.mark.asyncio
+async def test_instagram_callback_without_state_uses_pending_session_fallback(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "igfallback@example.com",
+            "password": "strongpass123",
+            "full_name": "IG Fallback Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    access_token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    monkeypatch.setenv("IG_APP_ID", "ig-app-id")
+    monkeypatch.setenv("IG_APP_SECRET", "ig-app-secret")
+    monkeypatch.setenv("META_STATE_SECRET", "test-meta-state-secret")
+    from app.core.config import get_settings
+    from app.services import meta as meta_service
+
+    get_settings.cache_clear()
+
+    async def _fake_exchange_ig_code(code: str, callback_url: str, settings):
+        assert code == "valid-code"
+        assert callback_url.endswith("/api/integrations/instagram/callback")
+        return "ig-token", 3600
+
+    async def _fake_fetch_ig_profile(token: str):
+        assert token == "ig-token"
+        return {"id": "ig-user-1", "username": "insta_test", "media_count": 3}
+
+    monkeypatch.setattr(meta_service, "exchange_ig_code", _fake_exchange_ig_code)
+    monkeypatch.setattr(meta_service, "fetch_ig_profile", _fake_fetch_ig_profile)
+
+    authorize_response = await client.get("/api/integrations/instagram/authorize", headers=headers)
+    assert authorize_response.status_code == 200
+
+    callback_response = await client.get(
+        "/api/integrations/instagram/callback?code=valid-code",
+        headers=headers,
+    )
+    assert callback_response.status_code in (302, 307)
+    assert "integrations?connected=instagram" in callback_response.headers.get("location", "")

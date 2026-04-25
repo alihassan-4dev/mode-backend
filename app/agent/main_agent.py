@@ -60,7 +60,7 @@ async def run_agent(
     llm = ChatOpenAI(
         api_key=settings.GROQ_API_KEY,
         base_url=settings.GROQ_BASE_URL,
-        model=settings.GROQ_MODEL,
+        model=settings.AGENT_GROQ_MODEL or settings.GROQ_MODEL,
         temperature=settings.AGENT_TEMPERATURE,
     ).bind_tools(tools)
 

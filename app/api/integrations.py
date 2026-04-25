@@ -20,6 +20,7 @@ import logging
 import time
 from typing import Annotated
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -199,7 +200,40 @@ async def fb_data(
     if not conn:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Facebook not connected")
 
-    posts = await meta.fetch_fb_posts(conn.access_token, limit=50)
+    posts: list[dict] = []
+    try:
+        posts = await meta.fetch_fb_posts(conn.access_token, limit=50)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        body = exc.response.text if exc.response is not None else ""
+        logger.warning(
+            "Facebook data sync failed user_id=%s status=%s body=%s",
+            user.id,
+            status_code,
+            body,
+        )
+
+        # Some business/page setups return this known Graph API limitation for /me/posts.
+        # Treat as a degraded-but-successful sync so UX still updates "last synced".
+        err_subcode = None
+        if exc.response is not None:
+            try:
+                err_subcode = (
+                    exc.response.json().get("error", {}).get("error_subcode")
+                )
+            except ValueError:
+                err_subcode = None
+        if status_code == 400 and err_subcode == 2069030:
+            logger.info(
+                "Facebook sync completed in limited mode user_id=%s reason=new_pages_experience",
+                user.id,
+            )
+            posts = []
+        else:
+            detail = "Facebook rejected the sync request. Reconnect Facebook and try again."
+            if status_code in {400, 401, 403}:
+                detail = "Facebook token/permissions are invalid or expired. Reconnect Facebook."
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
     total_likes = 0
     total_comments = 0

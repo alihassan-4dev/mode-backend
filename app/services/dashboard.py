@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.user import User
 from app.schemas.dashboard import DashboardMetric, DashboardSummaryResponse, MoodHistoryPoint, PlatformBreakdownItem
 from app.services import chat_store
+from app.services.dashboard_ai import generate_ai_dashboard_output
 from app.services import token_store
 
 
@@ -48,6 +50,7 @@ async def _build_mood_history(db: AsyncSession, user: User) -> list[MoodHistoryP
 
 
 async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSummaryResponse:
+    settings = get_settings()
     connections = await token_store.list_connections(db, user_id=user.id)
     connected_count = len(connections)
     connection_score = _profile_connection_score(connected_count)
@@ -98,20 +101,53 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
         )
 
     mood_history = await _build_mood_history(db, user)
+    recent_messages = await chat_store.list_recent_messages(db, user_id=user.id, limit=80)
+    ai_output = await generate_ai_dashboard_output(
+        settings=settings,
+        user_context={
+            "full_name": user.full_name or "",
+            "email": user.email or "",
+        },
+        connected_platforms=[connection.platform for connection in connections],
+        chat_messages=[
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "created_at": msg.created_at.isoformat(),
+            }
+            for msg in reversed(recent_messages)
+        ],
+    )
+    if ai_output is not None:
+        mood_score = ai_output.mood_score
+        stress_score = ai_output.stress_risk
+        readiness_score = ai_output.readiness
+        if ai_output.mood_history:
+            mood_history = [
+                MoodHistoryPoint(
+                    date=point["date"],
+                    mood=point["mood"],
+                    energy=point["energy"],
+                )
+                for point in ai_output.mood_history
+            ]
 
     recommendations = []
-    if connected_count == 0:
-        recommendations.append("Connect Facebook or Instagram to start live dashboard analysis.")
-    elif connected_count == 1:
-        connected_platform = connections[0].platform.title()
-        recommendations.append(f"{connected_platform} is connected. Connect the second platform for comparison.")
+    if ai_output is not None and ai_output.recommendations:
+        recommendations.extend(ai_output.recommendations)
     else:
-        recommendations.append("Both platforms are connected. Keep sync fresh so the dashboard stays accurate.")
+        if connected_count == 0:
+            recommendations.append("Connect Facebook or Instagram to start live dashboard analysis.")
+        elif connected_count == 1:
+            connected_platform = connections[0].platform.title()
+            recommendations.append(f"{connected_platform} is connected. Connect the second platform for comparison.")
+        else:
+            recommendations.append("Both platforms are connected. Keep sync fresh so the dashboard stays accurate.")
 
-    if mood_history:
-        recommendations.append("Your mood journey is based on your recent chat check-ins.")
-    else:
-        recommendations.append("Use the chat assistant for short daily check-ins to build a real mood timeline.")
+        if mood_history:
+            recommendations.append("Your mood journey is based on your recent chat check-ins.")
+        else:
+            recommendations.append("Use the chat assistant for short daily check-ins to build a real mood timeline.")
 
     return DashboardSummaryResponse(
         user_id=user.id,
@@ -123,9 +159,13 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
                 display_value=f"{round(mood_score, 1)}/100" if connected_count else "0/100",
                 trend="stable",
                 detail=(
-                    "Estimated from connected data sources and recent account context."
-                    if connected_count
-                    else "No connected data sources yet."
+                    "AI-estimated from connected data and recent chat context."
+                    if ai_output is not None
+                    else (
+                        "Estimated from connected data sources and recent account context."
+                        if connected_count
+                        else "No connected data sources yet."
+                    )
                 ),
             ),
             DashboardMetric(
@@ -134,9 +174,13 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
                 display_value=f"{round(stress_score, 1)}%" if connected_count else "0%",
                 trend="monitor",
                 detail=(
-                    "A lower score is better. This is currently a heuristic, not a medical assessment."
-                    if connected_count
-                    else "No live platform signal is available yet."
+                    "A lower score is better. AI signal is advisory only, not a medical assessment."
+                    if ai_output is not None
+                    else (
+                        "A lower score is better. This is currently a heuristic, not a medical assessment."
+                        if connected_count
+                        else "No live platform signal is available yet."
+                    )
                 ),
             ),
             DashboardMetric(

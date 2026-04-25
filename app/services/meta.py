@@ -172,17 +172,45 @@ async def fetch_fb_profile(token: str) -> dict:
 
 async def fetch_fb_posts(token: str, limit: int = 50) -> list[dict]:
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{FB_GRAPH}/me/posts",
-            params={
-                "fields": "id,message,created_time,type,likes.summary(true),comments.summary(true),shares",
-                "limit": limit,
-                "access_token": token,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("data", [])
+        common_params = {
+            "limit": limit,
+            "access_token": token,
+        }
+        # Some Facebook app modes/tokens reject specific edge fields (for example "shares")
+        # with 400 responses even when the endpoint is otherwise available.
+        field_sets = [
+            "id,message,created_time,type,likes.summary(true),comments.summary(true),shares",
+            "id,message,created_time,type,likes.summary(true),comments.summary(true)",
+        ]
+
+        last_exc: httpx.HTTPStatusError | None = None
+        for fields in field_sets:
+            resp = await client.get(
+                f"{FB_GRAPH}/me/posts",
+                params={
+                    "fields": fields,
+                    **common_params,
+                },
+            )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Facebook posts fetch failed; retrying with fallback fields "
+                    "status=%s fields=%s body=%s",
+                    exc.response.status_code if exc.response is not None else "unknown",
+                    fields,
+                    exc.response.text if exc.response is not None else "",
+                )
+                continue
+
+            data = resp.json()
+            return data.get("data", [])
+
+        if last_exc is not None:
+            raise last_exc
+        return []
 
 
 # ── Instagram Business Login ─────────────────────────────────────

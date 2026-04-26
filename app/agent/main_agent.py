@@ -159,6 +159,7 @@ async def _humanize_reply_after_leaked_tools(
         base_url=settings.GROQ_BASE_URL,
         model=settings.AGENT_GROQ_MODEL or settings.GROQ_MODEL,
         temperature=min(0.45, float(settings.AGENT_TEMPERATURE) + 0.12),
+        timeout=12.0,
     )
     system = (
         build_system_prompt(user)
@@ -231,6 +232,7 @@ async def run_agent(
         base_url=settings.GROQ_BASE_URL,
         model=settings.AGENT_GROQ_MODEL or settings.GROQ_MODEL,
         temperature=settings.AGENT_TEMPERATURE,
+        timeout=12.0,
     ).bind_tools(tools)
 
     async def call_model(state: ModeAgentState) -> ModeAgentState:
@@ -271,7 +273,7 @@ async def run_agent(
         messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
     messages.append(HumanMessage(content=message))
 
-    result = await compiled.ainvoke({"messages": messages, "used_tools": []}, {"recursion_limit": 8})
+    result = await compiled.ainvoke({"messages": messages, "used_tools": []}, {"recursion_limit": 6})
     final_message = result["messages"][-1]
     used_tools = list(result.get("used_tools", []))
 

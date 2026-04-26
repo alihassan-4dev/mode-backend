@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -9,7 +11,9 @@ from app.models.user import User
 from app.schemas.dashboard import DashboardMetric, DashboardSummaryResponse, MoodHistoryPoint, PlatformBreakdownItem
 from app.services import chat_store
 from app.services.dashboard_ai import generate_ai_dashboard_output
-from app.services import token_store
+from app.services import meta, token_store
+
+logger = logging.getLogger(__name__)
 
 
 def _keyword_score(text: str, keywords: set[str]) -> int:
@@ -56,7 +60,13 @@ async def _build_mood_history(db: AsyncSession, user: User) -> list[MoodHistoryP
     return history[-30:]
 
 
-async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSummaryResponse:
+async def build_dashboard_summary(
+    db: AsyncSession,
+    user: User,
+    *,
+    include_ai: bool = True,
+    include_live_activity: bool = True,
+) -> DashboardSummaryResponse:
     settings = get_settings()
     connections = await token_store.list_connections(db, user_id=user.id)
     connected_count = len(connections)
@@ -74,6 +84,8 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
     positive = _keyword_score(profile_text, {"calm", "focus", "balanced", "strong", "good", "well"})
     caution = _keyword_score(profile_text, {"stress", "tired", "burnout", "anxious", "sad"})
 
+    total_activity_count = 0
+    total_engagement_points = 0
     if connected_count:
         mood_score = max(35.0, min(92.0, 55.0 + connected_count * 10 + positive * 3 - caution * 4))
         stress_score = max(8.0, min(78.0, 32.0 - connected_count * 5 + caution * 7))
@@ -99,33 +111,78 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
         if not connection:
             continue
         item.connected = True
-        item.activity_count = 1
         item.connected_at = connection.connected_at
         item.last_synced_at = connection.last_synced_at
         item.summary = (
             f"{item.platform.title()} connected as "
             f"{connection.platform_name or connection.platform_username or connection.platform_user_id}."
         )
+        if not include_live_activity:
+            item.activity_count = 1
+            continue
+        try:
+            if item.platform == "facebook":
+                raw_posts = (await meta.fetch_fb_posts_detailed(connection.access_token, limit=10)).posts
+                likes = sum(int((post.get("likes", {}).get("summary", {}) or {}).get("total_count", 0) or 0) for post in raw_posts)
+                comments = sum(int((post.get("comments", {}).get("summary", {}) or {}).get("total_count", 0) or 0) for post in raw_posts)
+            else:
+                raw_posts = await meta.fetch_ig_media(connection.access_token, limit=10)
+                likes = 0
+                comments = 0
+            activity_count = len(raw_posts)
+            item.activity_count = activity_count
+            total_activity_count += activity_count
+            total_engagement_points += likes + (comments * 2)
+            item.summary = (
+                f"{item.platform.title()} connected as "
+                f"{connection.platform_name or connection.platform_username or connection.platform_user_id}. "
+                f"Fetched {activity_count} recent posts."
+            )
+        except httpx.HTTPStatusError:
+            logger.warning(
+                "Dashboard live activity fetch failed user_id=%s platform=%s",
+                user.id,
+                item.platform,
+            )
+            item.activity_count = 0
+            item.summary = f"{item.platform.title()} connected, but live posts could not be fetched right now."
+        except Exception:
+            logger.exception(
+                "Unexpected dashboard activity fetch failure user_id=%s platform=%s",
+                user.id,
+                item.platform,
+            )
+            item.activity_count = 0
+            item.summary = f"{item.platform.title()} connected, but activity is temporarily unavailable."
 
-    mood_history = await _build_mood_history(db, user)
+    if connected_count and include_live_activity:
+        activity_boost = min(20.0, total_activity_count * 1.6)
+        engagement_boost = min(15.0, total_engagement_points / 12.0)
+        mood_score = max(0.0, min(100.0, mood_score + activity_boost * 0.55 + engagement_boost * 0.45))
+        stress_score = max(0.0, min(100.0, stress_score - activity_boost * 0.25))
+        readiness_score = max(0.0, min(100.0, (mood_score + (100 - stress_score) + connection_score) / 3))
+
+    mood_history = await _build_mood_history(db, user) if connected_count else []
     recent_messages = await chat_store.list_recent_messages(db, user_id=user.id, limit=80)
-    ai_output = await generate_ai_dashboard_output(
-        settings=settings,
-        user_context={
-            "full_name": user.full_name or "",
-            "email": user.email or "",
-        },
-        connected_platforms=[connection.platform for connection in connections],
-        chat_messages=[
-            {
-                "role": msg.role,
-                "content": msg.content,
-                "created_at": msg.created_at.isoformat(),
-            }
-            for msg in reversed(recent_messages)
-        ],
-    )
-    if ai_output is not None:
+    ai_output = None
+    if include_ai:
+        ai_output = await generate_ai_dashboard_output(
+            settings=settings,
+            user_context={
+                "full_name": user.full_name or "",
+                "email": user.email or "",
+            },
+            connected_platforms=[connection.platform for connection in connections],
+            chat_messages=[
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat(),
+                }
+                for msg in reversed(recent_messages)
+            ],
+        )
+    if ai_output is not None and connected_count:
         mood_score = ai_output.mood_score
         stress_score = ai_output.stress_risk
         readiness_score = ai_output.readiness

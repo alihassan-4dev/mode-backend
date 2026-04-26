@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     AGENT_GROQ_MODEL: str = "llama-3.3-70b-versatile"
     AGENT_SYSTEM_NAME: str = "Counseling Corner"
     AGENT_TEMPERATURE: float = 0.2
+    AGENT_TIMEOUT_SECONDS: float = 20.0
     CHAT_HISTORY_MODE: str = "persistent"
 
     model_config = SettingsConfigDict(

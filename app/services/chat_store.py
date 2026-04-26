@@ -8,6 +8,7 @@ from threading import RLock
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.models.chat import ChatMessage, ChatSession
@@ -112,9 +113,24 @@ async def create_session(
         )
         _get_user_sessions(user_id)[session.id] = session
         return session
-    session = ChatSession(id=session_id or str(uuid.uuid4()), user_id=user_id, title=title)
+    resolved_session_id = session_id or str(uuid.uuid4())
+    session = ChatSession(id=resolved_session_id, user_id=user_id, title=title)
     db.add(session)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Parallel requests can attempt to create the same client-provided session id.
+        await db.rollback()
+        existing_result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == resolved_session_id,
+                ChatSession.user_id == user_id,
+            )
+        )
+        existing_session = existing_result.scalar_one_or_none()
+        if existing_session is not None:
+            return existing_session
+        raise
     await db.refresh(session)
     return session
 

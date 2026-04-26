@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 
 from app.core.config import Settings
 
@@ -15,6 +19,8 @@ logger = logging.getLogger(__name__)
 MAX_INPUT_CHARS = 24_000
 CHUNK_TARGET_CHARS = 5_000
 MAX_CHUNKS = 6
+MAX_LLM_RETRIES = 4
+_RETRY_DELAY_RE = re.compile(r"try again in ([0-9]+(?:\.[0-9]+)?)(ms|s)", re.IGNORECASE)
 
 
 @dataclass
@@ -82,6 +88,57 @@ def _build_llm(settings: Settings) -> ChatOpenAI:
     )
 
 
+def _extract_retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass
+
+    match = _RETRY_DELAY_RE.search(str(exc))
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    return value / 1000.0 if unit == "ms" else value
+
+
+def _backoff_seconds(attempt: int, exc: Exception) -> float:
+    hinted = _extract_retry_after_seconds(exc)
+    if hinted is not None:
+        return min(8.0, hinted + random.uniform(0.05, 0.2))
+    base = min(8.0, 0.5 * (2 ** (attempt - 1)))
+    return base + random.uniform(0.05, 0.3)
+
+
+async def _ainvoke_with_retry(
+    llm: ChatOpenAI,
+    messages: list[SystemMessage | HumanMessage],
+    *,
+    operation: str,
+) -> Any:
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        try:
+            return await llm.ainvoke(messages)
+        except (RateLimitError, APIConnectionError, APITimeoutError) as exc:
+            if attempt >= MAX_LLM_RETRIES:
+                raise
+            delay = _backoff_seconds(attempt, exc)
+            logger.warning(
+                "Dashboard AI %s transient failure (%s), retry %d/%d in %.2fs",
+                operation,
+                exc.__class__.__name__,
+                attempt,
+                MAX_LLM_RETRIES,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+
 async def _summarize_chunk(
     llm: ChatOpenAI,
     *,
@@ -104,7 +161,11 @@ async def _summarize_chunk(
             "Return JSON only."
         )
     )
-    response = await llm.ainvoke([system, user])
+    response = await _ainvoke_with_retry(
+        llm,
+        [system, user],
+        operation=f"chunk-summary-{idx}-{total}",
+    )
     payload = response.content if isinstance(response.content, str) else "{}"
     return _safe_json_loads(payload)
 
@@ -164,7 +225,7 @@ async def generate_ai_dashboard_output(
                 ensure_ascii=True,
             )
         )
-        response = await llm.ainvoke([system, user])
+        response = await _ainvoke_with_retry(llm, [system, user], operation="final-summary")
         payload = response.content if isinstance(response.content, str) else "{}"
         data = _safe_json_loads(payload)
         if not data:
@@ -205,6 +266,9 @@ async def generate_ai_dashboard_output(
             recommendations=recommendations,
             mood_history=mood_history,
         )
+    except (RateLimitError, APIConnectionError, APITimeoutError):
+        logger.warning("AI dashboard generation skipped after transient provider failures")
+        return None
     except Exception:
         logger.exception("AI dashboard generation failed")
         return None

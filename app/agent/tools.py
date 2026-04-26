@@ -47,7 +47,12 @@ async def build_agent_tools(db: AsyncSession, user: User):
     @tool("get_wellness_summary", args_schema=WellnessSummaryInput)
     async def get_wellness_summary(include_recommendations: bool = True) -> str:
         """Return the latest dashboard summary, real platform counts, mood history state, and recommendations."""
-        summary = await dashboard_service.build_dashboard_summary(db, user)
+        summary = await dashboard_service.build_dashboard_summary(
+            db,
+            user,
+            include_ai=False,
+            include_live_activity=False,
+        )
         lines = [
             f"generated_at={summary.generated_at.isoformat()}",
             f"user_id={summary.user_id}",
@@ -68,7 +73,12 @@ async def build_agent_tools(db: AsyncSession, user: User):
     @tool("explain_user_mode", args_schema=UserModeInput)
     async def explain_user_mode(detail_level: str = "short") -> str:
         """Explain how Mode understands the current user's dashboard state."""
-        summary = await dashboard_service.build_dashboard_summary(db, user)
+        summary = await dashboard_service.build_dashboard_summary(
+            db,
+            user,
+            include_ai=False,
+            include_live_activity=False,
+        )
         connected = [item.platform.title() for item in summary.platform_breakdown if item.connected]
         missing = [item.platform.title() for item in summary.platform_breakdown if not item.connected]
         base = (

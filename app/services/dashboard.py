@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,21 +32,28 @@ def _score_text_mood(text: str) -> tuple[float, float]:
 
 
 async def _build_mood_history(db: AsyncSession, user: User) -> list[MoodHistoryPoint]:
-    messages = await chat_store.list_recent_messages(db, user_id=user.id, limit=30)
+    # Pull enough messages to cover sparse activity, then trim strictly to the last 30 days.
+    messages = await chat_store.list_recent_messages(db, user_id=user.id, limit=300)
     user_messages = [message for message in reversed(messages) if message.role == "user"]
     history: list[MoodHistoryPoint] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
-    for message in user_messages[-14:]:
+    for message in user_messages:
+        created_at = message.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at < cutoff:
+            continue
         mood, energy = _score_text_mood(message.content)
         history.append(
             MoodHistoryPoint(
-                date=message.created_at.strftime("%b %d"),
+                date=created_at.date().isoformat(),
                 mood=mood,
                 energy=energy,
             )
         )
 
-    return history
+    return history[-30:]
 
 
 async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSummaryResponse:
@@ -122,15 +129,6 @@ async def build_dashboard_summary(db: AsyncSession, user: User) -> DashboardSumm
         mood_score = ai_output.mood_score
         stress_score = ai_output.stress_risk
         readiness_score = ai_output.readiness
-        if ai_output.mood_history:
-            mood_history = [
-                MoodHistoryPoint(
-                    date=point["date"],
-                    mood=point["mood"],
-                    energy=point["energy"],
-                )
-                for point in ai_output.mood_history
-            ]
 
     recommendations = []
     if ai_output is not None and ai_output.recommendations:

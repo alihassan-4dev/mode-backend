@@ -39,13 +39,17 @@ class Settings(BaseSettings):
     IG_APP_ID: str = ""
     IG_APP_SECRET: str = ""
     META_STATE_SECRET: str = "change-me-to-a-random-32-char-string"
+    # Optional comma-separated Facebook Login scopes (e.g. pages_show_list,pages_read_engagement).
+    # Only set after your Meta app is allowed to request those permissions; otherwise OAuth shows
+    # "Invalid Scopes". Default is empty so Connect works for basic profile + user_posts only.
+    FB_EXTRA_LOGIN_SCOPES: str = ""
     GROQ_API_KEY: str = ""
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     AGENT_GROQ_MODEL: str = "llama-3.3-70b-versatile"
     AGENT_SYSTEM_NAME: str = "Counseling Corner"
     AGENT_TEMPERATURE: float = 0.2
-    CHAT_HISTORY_MODE: str = "session"
+    CHAT_HISTORY_MODE: str = "persistent"
 
     model_config = SettingsConfigDict(
         env_file=".env",

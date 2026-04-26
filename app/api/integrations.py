@@ -170,7 +170,7 @@ async def fb_callback(
         platform_user_id=profile["id"],
         access_token=access_token,
         expires_in=expires_in,
-        scopes=meta.FB_SCOPES.split(","),
+        scopes=[s.strip() for s in meta.facebook_login_scopes(settings).split(",") if s.strip()],
         platform_username=None,
         platform_name=profile.get("name"),
         avatar_url=picture_url,

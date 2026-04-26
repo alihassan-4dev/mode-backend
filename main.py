@@ -19,6 +19,7 @@ from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.routes import router as api_router
 from app.api.integrations import router as integrations_router
+from app.api.social_posts import router as social_posts_router
 from app.core.config import get_settings
 from app.core.database import initialize_database
 
@@ -57,6 +58,7 @@ app.include_router(api_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(integrations_router, prefix="/api/integrations")
+app.include_router(social_posts_router, prefix="/api")
 
 
 @app.get("/")

@@ -34,7 +34,7 @@ Important values:
 - `META_APP_ID`, `META_APP_SECRET`, `META_STATE_SECRET`: Facebook and Instagram integration
 - `GROQ_API_KEY`: enables the LangChain-backed assistant
 - `GROQ_MODEL=openai/gpt-oss-120b`: default model target
-- `CHAT_HISTORY_MODE=session`: keeps agent memory only for the current running backend session
+- `CHAT_HISTORY_MODE=persistent`: stores chat sessions/messages in the database
 
 If `GROQ_API_KEY` is not set, chat still works through a deterministic fallback responder for local development and testing.
 

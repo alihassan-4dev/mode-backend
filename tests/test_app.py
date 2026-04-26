@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import pytest_asyncio
+import httpx
 from httpx import ASGITransport, AsyncClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -49,6 +50,23 @@ async def client(test_env):
         yield api_client
 
     await engine.dispose()
+
+
+def test_extract_leaked_tool_calls_strips_markup_and_parses_json():
+    from app.agent.main_agent import extract_leaked_tool_calls
+
+    text = """Hi Ali
+
+<function=get_wellness_summary>{"include_recommendations": true}</function>
+Please help.
+
+<function=explain_user_mode>{"detail_level": "short"}</function>
+"""
+    stripped, calls = extract_leaked_tool_calls(text)
+    assert "<function" not in stripped.lower()
+    assert [c[0] for c in calls] == ["get_wellness_summary", "explain_user_mode"]
+    assert calls[0][1] == {"include_recommendations": True}
+    assert calls[1][1] == {"detail_level": "short"}
 
 
 @pytest.mark.asyncio
@@ -201,9 +219,12 @@ async def test_integration_authorize_requires_and_uses_meta_config(client: Async
 
     facebook_response = await client.get("/api/integrations/facebook/authorize", headers=headers)
     assert facebook_response.status_code == 200
-    assert "facebook.com" in facebook_response.json()["url"]
-    assert "client_id=meta-app-id" in facebook_response.json()["url"]
-    assert "redirect_uri=http%3A%2F%2Ftestserver%2Fapi%2Fintegrations%2Ffacebook%2Fcallback" in facebook_response.json()["url"]
+    fb_url = facebook_response.json()["url"]
+    assert "facebook.com" in fb_url
+    assert "client_id=meta-app-id" in fb_url
+    # redirect_uri comes from PUBLIC_API_BASE_URL / request host in tests; only require path + query shape
+    assert "redirect_uri=" in fb_url
+    assert "api%2Fintegrations%2Ffacebook%2Fcallback" in fb_url
 
     instagram_response = await client.get("/api/integrations/instagram/authorize", headers=headers)
     assert instagram_response.status_code == 200
@@ -297,3 +318,189 @@ async def test_instagram_callback_without_state_uses_pending_session_fallback(cl
     )
     assert callback_response.status_code in (302, 307)
     assert "integrations?connected=instagram" in callback_response.headers.get("location", "")
+
+
+@pytest.mark.asyncio
+async def test_social_posts_success_for_facebook_and_instagram(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "socialposts@example.com",
+            "password": "strongpass123",
+            "full_name": "Social Posts Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    user_id = register_response.json()["user"]["id"]
+    token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from app.core.database import get_async_session_factory
+    from app.services import post_ai, token_store
+
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+    async with sessionmaker() as db:
+        await token_store.upsert_connection(
+            db,
+            user_id=user_id,
+            platform="facebook",
+            platform_user_id="fb-user",
+            access_token="fb-token",
+        )
+        await token_store.upsert_connection(
+            db,
+            user_id=user_id,
+            platform="instagram",
+            platform_user_id="ig-user",
+            access_token="ig-token",
+        )
+
+    from app.services import meta as meta_service
+    from app.services.meta import FacebookPostsFetchResult
+
+    async def _fake_fb_detailed(_token: str, limit: int = 50):
+        assert limit == 5
+        return FacebookPostsFetchResult(
+            posts=[
+                {
+                    "id": "fb-1",
+                    "message": "A good and calm post.",
+                    "created_time": "2026-04-25T12:10:00+0000",
+                    "type": "status",
+                    "likes": {"summary": {"total_count": 11}},
+                    "comments": {"summary": {"total_count": 3}},
+                }
+            ],
+            tried_npe_fallback=False,
+        )
+
+    async def _fake_ig_media(_token: str, limit: int = 50):
+        assert limit == 5
+        return [
+            {
+                "id": "ig-1",
+                "caption": "Quick update",
+                "media_type": "IMAGE",
+                "media_url": "https://example.com/p.jpg",
+                "timestamp": "2026-04-25T12:10:00+0000",
+                "permalink": "https://instagram.com/p/abc",
+            }
+        ]
+
+    async def _fake_attach_basic_ai_analysis(*, posts, settings):  # noqa: ANN001
+        for post in posts:
+            post.analysis = post_ai._heuristic_analysis(post.text, post.likes_count, post.comments_count)
+        return posts
+
+    monkeypatch.setattr(meta_service, "fetch_fb_posts_detailed", _fake_fb_detailed)
+    monkeypatch.setattr(meta_service, "fetch_ig_media", _fake_ig_media)
+    monkeypatch.setattr(post_ai, "attach_basic_ai_analysis", _fake_attach_basic_ai_analysis)
+
+    fb_response = await client.get("/api/social-posts?platform=facebook&limit=5", headers=headers)
+    assert fb_response.status_code == 200
+    fb_payload = fb_response.json()
+    assert fb_payload["meta"]["platform"] == "facebook"
+    assert fb_payload["meta"]["count"] == 1
+    assert fb_payload["posts"][0]["analysis"]["engagement_quality"] in {"medium", "high"}
+
+    ig_response = await client.get("/api/social-posts?platform=instagram&limit=5", headers=headers)
+    assert ig_response.status_code == 200
+    ig_payload = ig_response.json()
+    assert ig_payload["meta"]["platform"] == "instagram"
+    assert ig_payload["posts"][0]["post_id"] == "ig-1"
+    assert ig_payload["posts"][0]["analysis"]["sentiment_label"] in {"positive", "neutral", "negative"}
+
+
+@pytest.mark.asyncio
+async def test_social_posts_not_connected_and_upstream_error_mapping(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "socialposts-errors@example.com",
+            "password": "strongpass123",
+            "full_name": "Social Posts Errors Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    user_id = register_response.json()["user"]["id"]
+    token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    missing_conn_response = await client.get("/api/social-posts?platform=facebook", headers=headers)
+    assert missing_conn_response.status_code == 404
+    assert "not connected" in missing_conn_response.json()["detail"].lower()
+
+    from app.core.database import get_async_session_factory
+    from app.services import token_store
+
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+    async with sessionmaker() as db:
+        await token_store.upsert_connection(
+            db,
+            user_id=user_id,
+            platform="facebook",
+            platform_user_id="fb-user",
+            access_token="fb-token",
+        )
+
+    from app.services import meta as meta_service
+
+    async def _raise_http_status_error(_token: str, limit: int = 50):  # noqa: ARG001
+        request = httpx.Request("GET", "https://graph.facebook.com/v21.0/me/posts")
+        response = httpx.Response(401, request=request, json={"error": {"message": "Invalid OAuth token"}})
+        raise httpx.HTTPStatusError("Unauthorized", request=request, response=response)
+
+    monkeypatch.setattr(meta_service, "fetch_fb_posts_detailed", _raise_http_status_error)
+    failed_response = await client.get("/api/social-posts?platform=facebook", headers=headers)
+    assert failed_response.status_code == 502
+    assert "Reconnect Facebook" in failed_response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_social_posts_facebook_new_pages_experience_returns_empty_success(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    register_response = await client.post(
+        "/api/auth/register",
+        json={
+            "email": "socialposts-fb-pages@example.com",
+            "password": "strongpass123",
+            "full_name": "Social Posts FB Pages Tester",
+        },
+    )
+    assert register_response.status_code == 200
+    user_id = register_response.json()["user"]["id"]
+    token = register_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from app.core.database import get_async_session_factory
+    from app.services import token_store
+
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+    async with sessionmaker() as db:
+        await token_store.upsert_connection(
+            db,
+            user_id=user_id,
+            platform="facebook",
+            platform_user_id="fb-user",
+            access_token="fb-token",
+        )
+
+    from app.services import meta as meta_service
+    from app.services.meta import FacebookPostsFetchResult
+
+    async def _empty_after_npe_fallback(_token: str, limit: int = 50):  # noqa: ARG001
+        return FacebookPostsFetchResult(posts=[], tried_npe_fallback=True)
+
+    monkeypatch.setattr(meta_service, "fetch_fb_posts_detailed", _empty_after_npe_fallback)
+    response = await client.get("/api/social-posts?platform=facebook&limit=10", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["meta"]["platform"] == "facebook"
+    assert payload["posts"] == []
+    assert payload["meta"].get("notice")
+    assert "new pages experience" in payload["meta"]["notice"].lower()

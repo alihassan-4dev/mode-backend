@@ -1,5 +1,6 @@
 from app.models.chat import ChatMessage, ChatSession
+from app.models.post_report import PostReport
 from app.models.social_connection import SocialConnection
 from app.models.user import User
 
-__all__ = ["ChatMessage", "ChatSession", "SocialConnection", "User"]
+__all__ = ["ChatMessage", "ChatSession", "PostReport", "SocialConnection", "User"]

@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     AGENT_TEMPERATURE: float = 0.2
     AGENT_TIMEOUT_SECONDS: float = 20.0
     CHAT_HISTORY_MODE: str = "persistent"
+    # Background report refresh interval (minutes). Reports regenerate via the LLM
+    # for each connected user on this cadence.
+    REPORTS_REFRESH_MINUTES: int = 5
+    # Max posts per platform fetched and analyzed per refresh cycle.
+    REPORTS_POSTS_PER_PLATFORM: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

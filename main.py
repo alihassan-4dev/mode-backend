@@ -19,9 +19,11 @@ from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.routes import router as api_router
 from app.api.integrations import router as integrations_router
+from app.api.reports import router as reports_router
 from app.api.social_posts import router as social_posts_router
 from app.core.config import get_settings
 from app.core.database import initialize_database
+from app.services.report_scheduler import start_scheduler, stop_scheduler
 
 settings = get_settings()
 _log = logging.getLogger("uvicorn.error")
@@ -41,7 +43,12 @@ async def lifespan(app: FastAPI):
             sqlite3.sqlite_version,
         )
     _log.info("Chat history mode: %s", settings.CHAT_HISTORY_MODE.strip().lower() or "session")
-    yield
+    _log.info("Reports refresh interval: %d min", settings.REPORTS_REFRESH_MINUTES)
+    start_scheduler()
+    try:
+        yield
+    finally:
+        await stop_scheduler()
 
 
 app = FastAPI(title="E-Mode API", version="1.0.0", lifespan=lifespan)
@@ -59,6 +66,7 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(integrations_router, prefix="/api/integrations")
 app.include_router(social_posts_router, prefix="/api")
+app.include_router(reports_router, prefix="/api")
 
 
 @app.get("/")

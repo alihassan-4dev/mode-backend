@@ -6,9 +6,11 @@ schedule (see `app.services.report_scheduler`).
 
 from __future__ import annotations
 
+
 import json
 import logging
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -26,6 +28,28 @@ from app.services import meta, post_ai
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_CHARS = 600
+
+# Controlled mode vocabulary used across the app. Keep this in sync with
+# frontend display/colors (see Reports.tsx and dashboard ModeReportCard).
+MODE_LABELS: tuple[str, ...] = (
+    "Energetic",
+    "Joyful",
+    "Calm",
+    "Focused",
+    "Reflective",
+    "Social",
+    "Stressed",
+    "Anxious",
+    "Burned-out",
+    "Withdrawn",
+)
+
+# Sentiment-based fallback when no LLM is available.
+_HEURISTIC_MODE_BY_SENTIMENT = {
+    "positive": ("Joyful", 0.55),
+    "neutral": ("Reflective", 0.45),
+    "negative": ("Stressed", 0.55),
+}
 
 
 def _build_llm(settings: Settings) -> ChatOpenAI:
@@ -91,6 +115,9 @@ def _heuristic_full(post: SocialPostOut) -> dict[str, Any]:
     likes = post.likes_count or 0
     comments = post.comments_count or 0
     engagement = likes + comments * 2
+    mode_label, mode_conf = _HEURISTIC_MODE_BY_SENTIMENT.get(
+        base.sentiment_label, ("Reflective", 0.4)
+    )
     return {
         "sentiment_label": base.sentiment_label,
         "sentiment_score": base.sentiment_score,
@@ -102,6 +129,9 @@ def _heuristic_full(post: SocialPostOut) -> dict[str, Any]:
         "topics": [],
         "strengths": [],
         "weaknesses": [],
+        "mode_label": mode_label,
+        "mode_confidence": mode_conf,
+        "mode_drivers": [base.sentiment_label],
     }
 
 
@@ -117,14 +147,20 @@ async def _llm_analyze_post(post: SocialPostOut, settings: Settings) -> dict[str
             "comments": post.comments_count or 0,
             "media_type": post.media_type or "unknown",
         }
+        mode_choices = "|".join(MODE_LABELS)
         system = SystemMessage(
             content=(
-                "You are an expert social-media analyst. Return a strict JSON object analyzing ONE post. "
-                "Keys: sentiment_label(positive|neutral|negative), sentiment_score(-1..1), "
+                "You are an expert wellness + social-media analyst for the Mode app. "
+                "Read ONE social post and decide: (1) sentiment/engagement signals, "
+                "(2) which user MODE this single post most likely reflects. "
+                "Return a strict JSON object with keys: "
+                "sentiment_label(positive|neutral|negative), sentiment_score(-1..1), "
                 "engagement_quality(low|medium|high), engagement_score(0..100), "
                 "tone(short word like cheerful, formal, urgent), summary(<=160 chars human summary), "
                 "topics(list of 1-4 short tags), strengths(list of 1-3 strings), "
-                "weaknesses(list of 1-3 strings), recommendation(<=180 chars actionable advice). "
+                "weaknesses(list of 1-3 strings), recommendation(<=180 chars actionable advice), "
+                f"mode_label(one of: {mode_choices}), mode_confidence(0..1), "
+                "mode_drivers(list of 1-3 short cues from the post that drove the mode pick). "
                 "JSON only, no markdown."
             )
         )
@@ -144,6 +180,23 @@ async def _llm_analyze_post(post: SocialPostOut, settings: Settings) -> dict[str
                 return [str(item)[:60] for item in value][:4]
             return []
 
+        mode_label_raw = str(data.get("mode_label", "")).strip()
+        mode_label = next(
+            (m for m in MODE_LABELS if m.lower() == mode_label_raw.lower()),
+            None,
+        )
+        if mode_label is None:
+            fallback_label, fallback_conf = _HEURISTIC_MODE_BY_SENTIMENT.get(
+                str(data.get("sentiment_label", "neutral")), ("Reflective", 0.4)
+            )
+            mode_label = fallback_label
+            mode_conf = fallback_conf
+        else:
+            try:
+                mode_conf = max(0.0, min(1.0, float(data.get("mode_confidence", 0.6))))
+            except (TypeError, ValueError):
+                mode_conf = 0.6
+
         return {
             "sentiment_label": str(data.get("sentiment_label", "neutral")),
             "sentiment_score": float(data.get("sentiment_score", 0.0)),
@@ -155,6 +208,9 @@ async def _llm_analyze_post(post: SocialPostOut, settings: Settings) -> dict[str
             "topics": _list("topics"),
             "strengths": _list("strengths"),
             "weaknesses": _list("weaknesses"),
+            "mode_label": mode_label,
+            "mode_confidence": mode_conf,
+            "mode_drivers": _list("mode_drivers"),
             "raw": data,
         }
     except Exception:
@@ -196,6 +252,9 @@ async def _upsert_report(
         strengths=analysis.get("strengths") or [],
         weaknesses=analysis.get("weaknesses") or [],
         raw_analysis=analysis.get("raw") or {},
+        mode_label=analysis.get("mode_label"),
+        mode_confidence=analysis.get("mode_confidence"),
+        mode_drivers=analysis.get("mode_drivers") or [],
         updated_at=now,
     )
 
@@ -321,3 +380,95 @@ def build_overall_overview(reports: list[PostReport]) -> tuple[list[dict], str |
             )
 
     return overall, recommendation
+
+
+# ── Mode decision rollups ────────────────────────────────────────
+
+# Each mode is grouped into a high-level "vibe" used for the dashboard tone.
+MODE_VIBE: dict[str, str] = {
+    "Energetic": "uplifted",
+    "Joyful": "uplifted",
+    "Calm": "balanced",
+    "Focused": "balanced",
+    "Reflective": "balanced",
+    "Social": "uplifted",
+    "Stressed": "strained",
+    "Anxious": "strained",
+    "Burned-out": "strained",
+    "Withdrawn": "strained",
+}
+
+
+def _weighted_mode_pick(reports: list[PostReport]) -> tuple[str | None, float, list[dict]]:
+    """Return (top mode, confidence 0..1, distribution list)."""
+    if not reports:
+        return None, 0.0, []
+    weights: dict[str, float] = {}
+    for report in reports:
+        if not report.mode_label:
+            continue
+        weight = float(report.mode_confidence or 0.5)
+        weights[report.mode_label] = weights.get(report.mode_label, 0.0) + weight
+    if not weights:
+        return None, 0.0, []
+    total = sum(weights.values()) or 1.0
+    distribution = [
+        {"label": label, "share": round(value / total, 3), "count": Counter(
+            r.mode_label for r in reports if r.mode_label
+        ).get(label, 0)}
+        for label, value in sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    top_label, top_weight = max(weights.items(), key=lambda kv: kv[1])
+    confidence = round(top_weight / total, 3)
+    return top_label, confidence, distribution
+
+
+def _filter_recent(reports: list[PostReport], *, days: int) -> list[PostReport]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out: list[PostReport] = []
+    for report in reports:
+        ref = report.post_created_at or report.updated_at
+        if ref is None:
+            continue
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        if ref >= cutoff:
+            out.append(report)
+    return out
+
+
+def _mode_narrative(label: str | None, confidence: float, count: int, *, period: str) -> str:
+    if not label or count == 0:
+        return f"Not enough {period} signal yet. Connect more sources or post a few times to unlock a mode read."
+    vibe = MODE_VIBE.get(label, "balanced")
+    pct = int(round(confidence * 100))
+    if vibe == "uplifted":
+        return (
+            f"Your {period} mode reads as {label} ({pct}% confidence across {count} posts). "
+            "Keep this rhythm — your content is energizing your audience."
+        )
+    if vibe == "strained":
+        return (
+            f"Your {period} mode skews {label} ({pct}% confidence across {count} posts). "
+            "Consider lighter scheduling, a calmer tone, or a recovery break."
+        )
+    return (
+        f"Your {period} mode is {label} ({pct}% confidence across {count} posts). "
+        "Steady — a focused, intentional cadence is showing."
+    )
+
+
+def build_mode_summary(reports: list[PostReport], *, period: str, days: int | None) -> dict:
+    """Build a mode summary for a window. period is 'current' | 'weekly' | 'monthly'."""
+    sliced = reports if days is None else _filter_recent(reports, days=days)
+    label, confidence, distribution = _weighted_mode_pick(sliced)
+    return {
+        "period": period,
+        "window_days": days,
+        "post_count": len(sliced),
+        "mode_label": label,
+        "mode_vibe": MODE_VIBE.get(label or "", None),
+        "confidence": confidence,
+        "distribution": distribution,
+        "narrative": _mode_narrative(label, confidence, len(sliced), period=period),
+    }

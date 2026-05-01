@@ -6,6 +6,23 @@ from typing import Literal
 from pydantic import BaseModel
 
 
+class ModeDistributionItem(BaseModel):
+    label: str
+    share: float
+    count: int
+
+
+class ModeSummary(BaseModel):
+    period: Literal["current", "weekly", "monthly"]
+    window_days: int | None = None
+    post_count: int
+    mode_label: str | None = None
+    mode_vibe: str | None = None
+    confidence: float
+    distribution: list[ModeDistributionItem] = []
+    narrative: str
+
+
 class PostReportOut(BaseModel):
     platform: Literal["facebook", "instagram"]
     post_id: str
@@ -26,6 +43,9 @@ class PostReportOut(BaseModel):
     topics: list[str] = []
     strengths: list[str] = []
     weaknesses: list[str] = []
+    mode_label: str | None = None
+    mode_confidence: float | None = None
+    mode_drivers: list[str] = []
     generated_at: datetime
     updated_at: datetime
 
@@ -55,3 +75,6 @@ class ReportsResponse(BaseModel):
     instagram: list[PostReportOut]
     overall: list[PlatformOverview]
     overall_recommendation: str | None = None
+    current_mode: ModeSummary
+    weekly_mode: ModeSummary
+    monthly_mode: ModeSummary

@@ -11,6 +11,7 @@ from app.core.database import get_db
 from app.deps import get_current_user
 from app.models.user import User
 from app.schemas.reports import (
+    ModeSummary,
     OverallSentimentPoint,
     PlatformOverview,
     PostReportOut,
@@ -45,6 +46,9 @@ def _to_out(report) -> PostReportOut:
         topics=report.topics or [],
         strengths=report.strengths or [],
         weaknesses=report.weaknesses or [],
+        mode_label=report.mode_label,
+        mode_confidence=report.mode_confidence,
+        mode_drivers=report.mode_drivers or [],
         generated_at=report.generated_at,
         updated_at=report.updated_at,
     )
@@ -74,6 +78,16 @@ async def get_reports(
     overview_dicts, overall_recommendation = reports_service.build_overall_overview(reports)
     overview = [PlatformOverview(**item) for item in overview_dicts]
 
+    current = ModeSummary(
+        **reports_service.build_mode_summary(reports, period="current", days=None)
+    )
+    weekly = ModeSummary(
+        **reports_service.build_mode_summary(reports, period="weekly", days=7)
+    )
+    monthly = ModeSummary(
+        **reports_service.build_mode_summary(reports, period="monthly", days=30)
+    )
+
     return ReportsResponse(
         user_id=user.id,
         generated_at=datetime.now(timezone.utc),
@@ -83,6 +97,9 @@ async def get_reports(
         instagram=ig,
         overall=overview,
         overall_recommendation=overall_recommendation,
+        current_mode=current,
+        weekly_mode=weekly,
+        monthly_mode=monthly,
     )
 
 
@@ -103,6 +120,24 @@ async def refresh_reports(
             detail="Could not refresh reports right now.",
         ) from exc
     return await get_reports(user=user, db=db)  # type: ignore[arg-type]
+
+
+class ModeOverview(ReportsResponse):
+    """Reused as the response of /reports/mode for the dashboard."""
+
+
+@router.get("/mode", response_model=dict)
+async def get_mode_overview(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight mode read for the dashboard (current + weekly + monthly)."""
+    reports = await reports_service.get_user_reports(db, user_id=user.id)
+    return {
+        "current": reports_service.build_mode_summary(reports, period="current", days=None),
+        "weekly": reports_service.build_mode_summary(reports, period="weekly", days=7),
+        "monthly": reports_service.build_mode_summary(reports, period="monthly", days=30),
+    }
 
 
 # Re-export to silence unused import warning for the schema module.

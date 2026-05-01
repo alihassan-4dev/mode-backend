@@ -43,6 +43,11 @@ class PostReport(Base):
     weaknesses: Mapped[list | None] = mapped_column(JSON, default=list)
     raw_analysis: Mapped[dict | None] = mapped_column(JSON, default=dict)
 
+    # Mode decision: which "mode" this single post signals about the user.
+    mode_label: Mapped[str | None] = mapped_column(String(40), index=True)
+    mode_confidence: Mapped[float | None] = mapped_column(Float)
+    mode_drivers: Mapped[list | None] = mapped_column(JSON, default=list)
+
     generated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

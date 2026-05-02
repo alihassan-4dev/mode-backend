@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 import sys
 
 import pytest
@@ -67,6 +68,151 @@ Please help.
     assert [c[0] for c in calls] == ["get_wellness_summary", "explain_user_mode"]
     assert calls[0][1] == {"include_recommendations": True}
     assert calls[1][1] == {"detail_level": "short"}
+
+
+@pytest.mark.asyncio
+async def test_initialize_database_upgrades_unversioned_legacy_post_reports_schema(test_env):
+    from app.core.config import get_settings
+    from app.core.database import initialize_database
+
+    settings = get_settings()
+    db_path = Path(settings.database_url_sync.replace("sqlite:///", "", 1))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        PRAGMA foreign_keys=ON;
+
+        CREATE TABLE users (
+            id VARCHAR(36) NOT NULL PRIMARY KEY,
+            email VARCHAR(255) NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            full_name VARCHAR(255),
+            created_at DATETIME NOT NULL
+        );
+        CREATE INDEX ix_users_email ON users (email);
+
+        CREATE TABLE social_connections (
+            id VARCHAR(36) NOT NULL PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            platform VARCHAR(20) NOT NULL,
+            platform_user_id VARCHAR(255) NOT NULL,
+            platform_username VARCHAR(255),
+            platform_name VARCHAR(255),
+            avatar_url TEXT,
+            access_token TEXT NOT NULL,
+            token_expires_at DATETIME,
+            scopes JSON,
+            raw_profile JSON,
+            connected_at DATETIME NOT NULL,
+            last_synced_at DATETIME,
+            CONSTRAINT uq_user_platform UNIQUE (user_id, platform),
+            CONSTRAINT ck_platform_values CHECK (platform IN ('facebook', 'instagram')),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX ix_social_connections_user_id ON social_connections (user_id);
+
+        CREATE TABLE chat_sessions (
+            id VARCHAR(36) NOT NULL PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX ix_chat_sessions_user_id ON chat_sessions (user_id);
+
+        CREATE TABLE chat_messages (
+            id VARCHAR(36) NOT NULL PRIMARY KEY,
+            session_id VARCHAR(36) NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX ix_chat_messages_session_id ON chat_messages (session_id);
+
+        CREATE TABLE post_reports (
+            id VARCHAR(36) NOT NULL PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            platform VARCHAR(20) NOT NULL,
+            post_id VARCHAR(255) NOT NULL,
+            post_text TEXT,
+            permalink TEXT,
+            media_type VARCHAR(50),
+            media_url TEXT,
+            post_created_at DATETIME,
+            likes_count INTEGER,
+            comments_count INTEGER,
+            sentiment_label VARCHAR(20),
+            sentiment_score FLOAT,
+            engagement_quality VARCHAR(20),
+            engagement_score FLOAT,
+            recommendation TEXT,
+            summary TEXT,
+            tone VARCHAR(50),
+            topics JSON,
+            strengths JSON,
+            weaknesses JSON,
+            raw_analysis JSON,
+            generated_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            CONSTRAINT ck_post_report_platform CHECK (platform IN ('facebook', 'instagram')),
+            CONSTRAINT uq_user_platform_post UNIQUE (user_id, platform, post_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX ix_post_reports_user_id ON post_reports (user_id);
+        CREATE INDEX ix_post_reports_platform ON post_reports (platform);
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO users (id, email, password_hash, full_name, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "user-1",
+            "legacy@example.com",
+            "hashed",
+            "Legacy User",
+            "2026-05-01T10:00:00+00:00",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO post_reports (
+            id, user_id, platform, post_id, post_text, generated_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "report-1",
+            "user-1",
+            "facebook",
+            "post-1",
+            "Legacy report body",
+            "2026-05-01T10:00:00+00:00",
+            "2026-05-01T10:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    await initialize_database()
+
+    conn = sqlite3.connect(db_path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(post_reports)").fetchall()}
+    versions = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+    legacy_row = conn.execute(
+        "SELECT post_text, mode_label, mode_confidence FROM post_reports WHERE id = ?",
+        ("report-1",),
+    ).fetchone()
+    conn.close()
+
+    assert {"mode_label", "mode_confidence", "mode_drivers"}.issubset(columns)
+    assert versions == [("004",)]
+    assert legacy_row == ("Legacy report body", None, None)
 
 
 @pytest.mark.asyncio

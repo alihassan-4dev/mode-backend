@@ -238,8 +238,9 @@ async def fb_data(
     total_likes = 0
     total_comments = 0
     for p in posts:
-        total_likes += p.get("likes", {}).get("summary", {}).get("total_count", 0)
-        total_comments += p.get("comments", {}).get("summary", {}).get("total_count", 0)
+        li, co = meta.fb_engagement_counts(p)
+        total_likes += li
+        total_comments += co
 
     conn.last_synced_at = datetime.now(timezone.utc)
     await db.commit()

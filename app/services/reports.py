@@ -62,23 +62,29 @@ def _build_llm(settings: Settings) -> ChatOpenAI:
     )
 
 
-def _normalize_facebook(post: dict) -> SocialPostOut:
-    likes = post.get("likes", {}).get("summary", {}).get("total_count", 0)
-    comments = post.get("comments", {}).get("summary", {}).get("total_count", 0)
+def _normalize_facebook(post: dict) -> SocialPostOut | None:
+    post_id = post.get("id")
+    if not post_id:
+        return None
+    likes_count, comments_count = meta.fb_engagement_counts(post)
     permalink = post.get("permalink_url")
-    if not permalink and post.get("id"):
-        permalink = f"https://www.facebook.com/{post['id']}"
-    return SocialPostOut(
-        platform="facebook",
-        post_id=str(post.get("id", "")),
-        text=post.get("message"),
-        created_at=post.get("created_time"),
-        permalink=permalink,
-        media_type=post.get("type"),
-        media_url=None,
-        likes_count=int(likes or 0),
-        comments_count=int(comments or 0),
-    )
+    if not permalink:
+        permalink = f"https://www.facebook.com/{post_id}"
+    try:
+        return SocialPostOut(
+            platform="facebook",
+            post_id=str(post_id),
+            text=meta.fb_caption_text(post),
+            created_at=post.get("created_time"),
+            permalink=permalink,
+            media_type=post.get("type"),
+            media_url=meta.fb_thumbnail_url(post),
+            likes_count=likes_count,
+            comments_count=comments_count,
+        )
+    except Exception:
+        logger.warning("Skipping malformed Facebook post in reports post_id=%s", post_id)
+        return None
 
 
 def _normalize_instagram(post: dict) -> SocialPostOut:
@@ -101,7 +107,11 @@ async def _fetch_platform_posts(
     try:
         if platform == "facebook":
             result = await meta.fetch_fb_posts_detailed(token, limit=limit)
-            return [_normalize_facebook(p) for p in result.posts]
+            return [
+                p
+                for p in (_normalize_facebook(x) for x in result.posts)
+                if p is not None
+            ]
         if platform == "instagram":
             raw = await meta.fetch_ig_media(token, limit=limit)
             return [_normalize_instagram(p) for p in raw]

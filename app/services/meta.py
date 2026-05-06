@@ -5,8 +5,8 @@ Facebook flow:
   1. build_fb_authorize_url  → user opens in browser
   2. exchange_fb_code        → short-lived token → long-lived token
   3. fetch_fb_profile        → /me with fields
-  4. fetch_fb_posts          → /me/posts, then user-only fallback for New Pages experience:
-     - /me?fields=feed.limit(n){...} (nested feed; works for some NPE profiles where /me/posts does not)
+  4. fetch_fb_posts          → /me/posts with progressive field fallbacks, then optional:
+     - /me?fields=feed.limit(n){...} (nested feed when /me/posts never succeeds; NPE and similar)
 
 Instagram Business Login flow:
   1. build_ig_authorize_url
@@ -29,6 +29,8 @@ from httpx import AsyncClient, HTTPStatusError
 from app.core.config import Settings
 
 FB_GRAPH = "https://graph.facebook.com/v21.0"
+# OAuthException codes that indicate a bad/expired/revoked token — must propagate, never degrade to empty.
+_FB_OAUTH_HARD_FAIL_CODES = frozenset({102, 190, 458})
 FB_OAUTH_DIALOG = "https://www.facebook.com/v21.0/dialog/oauth"
 # Instagram Business Login authorization window
 IG_OAUTH_AUTHORIZE = "https://www.instagram.com/oauth/authorize"
@@ -183,30 +185,88 @@ async def fetch_fb_profile(token: str) -> dict:
         return resp.json()
 
 
-def _fb_http_error_subcode(exc: HTTPStatusError) -> int | None:
+def _fb_http_error_should_propagate(exc: HTTPStatusError) -> bool:
+    """True when Graph returns an OAuth/session failure that callers must surface."""
+
     if exc.response is None:
-        return None
+        return False
     try:
         payload = exc.response.json()
-        err = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(err, dict) and err.get("error_subcode") is not None:
-            return int(err["error_subcode"])
-    except (ValueError, TypeError, KeyError):
-        return None
+    except ValueError:
+        return False
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return False
+    if err.get("type") != "OAuthException":
+        return False
+    code = err.get("code")
+    try:
+        code_int = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_int = None
+    return code_int is not None and code_int in _FB_OAUTH_HARD_FAIL_CODES
+
+
+def fb_engagement_counts(post: dict) -> tuple[int, int]:
+    """Best-effort like/comment totals from Graph `likes` / `comments` summary objects."""
+
+    likes_box = post.get("likes") or {}
+    comments_box = post.get("comments") or {}
+    raw_likes = likes_box.get("summary", {}).get("total_count", 0) if isinstance(likes_box, dict) else 0
+    raw_comments = comments_box.get("summary", {}).get("total_count", 0) if isinstance(comments_box, dict) else 0
+    try:
+        return int(raw_likes or 0), int(raw_comments or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def fb_caption_text(post: dict) -> str | None:
+    """Prefer `message`; fall back to `story` (common for reshares / some media posts)."""
+
+    for key in ("message", "story"):
+        val = post.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
     return None
 
 
-async def _fetch_fb_posts_me_posts_edge(token: str, limit: int) -> list[dict]:
-    """Classic path: GET /me/posts."""
+def fb_thumbnail_url(post: dict) -> str | None:
+    """Preview image when Graph returns full_picture/picture on the post."""
+
+    fp = post.get("full_picture")
+    if isinstance(fp, str) and fp.strip():
+        return fp.strip()
+    pic = post.get("picture")
+    if isinstance(pic, str) and pic.strip():
+        return pic.strip()
+    return None
+
+
+async def _fetch_fb_posts_me_posts_edge(token: str, limit: int) -> tuple[list[dict], bool]:
+    """GET /me/posts with progressively smaller field lists so mixed post types still return.
+
+    Returns (posts, success). ``success`` is True when Meta returned HTTP 200 (including an empty list).
+    On repeated non-auth failures, returns ([], False) so callers can try other strategies without
+    surfacing a hard error to the user.
+    """
     async with AsyncClient(timeout=15.0) as client:
         common_params = {
             "limit": limit,
             "access_token": token,
         }
-        field_sets = [
+        # Richest-first; drop fields that commonly break certain post types or permission shapes.
+        field_sets = (
+            "id,message,story,created_time,type,permalink_url,likes.summary(true),comments.summary(true),shares",
+            "id,message,story,created_time,type,permalink_url,likes.summary(true),comments.summary(true)",
             "id,message,created_time,type,permalink_url,likes.summary(true),comments.summary(true),shares",
             "id,message,created_time,type,permalink_url,likes.summary(true),comments.summary(true)",
-        ]
+            "id,message,story,created_time,type,permalink_url,full_picture",
+            "id,message,created_time,type,permalink_url,full_picture",
+            "id,message,story,created_time,type,permalink_url",
+            "id,message,created_time,type,permalink_url",
+            "id,story,created_time,type,permalink_url",
+            "id,created_time,type,permalink_url",
+        )
 
         last_exc: HTTPStatusError | None = None
         for fields in field_sets:
@@ -221,21 +281,29 @@ async def _fetch_fb_posts_me_posts_edge(token: str, limit: int) -> list[dict]:
                 resp.raise_for_status()
             except HTTPStatusError as exc:
                 last_exc = exc
+                if _fb_http_error_should_propagate(exc):
+                    raise
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in (401, 403):
+                    raise
                 logger.warning(
-                    "Facebook posts fetch failed; retrying with fallback fields "
+                    "Facebook /me/posts request failed; trying narrower fields "
                     "status=%s fields=%s body=%s",
-                    exc.response.status_code if exc.response is not None else "unknown",
+                    status_code if status_code is not None else "unknown",
                     fields,
                     exc.response.text if exc.response is not None else "",
                 )
                 continue
 
             data = resp.json()
-            return data.get("data", [])
+            return data.get("data", []) or [], True
 
         if last_exc is not None:
-            raise last_exc
-        return []
+            logger.warning(
+                "Facebook /me/posts: exhausted field fallbacks status=%s",
+                last_exc.response.status_code if last_exc.response is not None else "unknown",
+            )
+        return [], False
 
 
 async def _fetch_fb_posts_me_embedded_feed(token: str, limit: int) -> list[dict]:
@@ -244,28 +312,49 @@ async def _fetch_fb_posts_me_embedded_feed(token: str, limit: int) -> list[dict]
     Cap at 100 per Graph guidance for this pattern.
     """
     cap = min(max(limit, 1), 100)
-    # Keep embedded feed fields minimal. Some New Pages experience accounts reject
-    # nested likes/comments on /me?fields=feed... with "(#100) nonexisting field".
-    inner = "id,message,created_time,type,permalink_url"
-    fields = f"feed.limit({cap}){{{inner}}}"
+    inner_sets = (
+        "id,message,story,created_time,type,permalink_url,full_picture",
+        "id,message,created_time,type,permalink_url,full_picture",
+        "id,message,story,created_time,type,permalink_url",
+        "id,message,created_time,type,permalink_url",
+        "id,created_time,type,permalink_url",
+    )
     async with AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{FB_GRAPH}/me",
-            params={"fields": fields, "access_token": token},
-        )
-        try:
-            resp.raise_for_status()
-        except HTTPStatusError as exc:
-            logger.warning(
-                "Facebook embedded /me feed fetch failed status=%s body=%s",
-                exc.response.status_code if exc.response is not None else "unknown",
-                exc.response.text if exc.response is not None else "",
+        last_exc: HTTPStatusError | None = None
+        for inner in inner_sets:
+            fields = f"feed.limit({cap}){{{inner}}}"
+            resp = await client.get(
+                f"{FB_GRAPH}/me",
+                params={"fields": fields, "access_token": token},
             )
+            try:
+                resp.raise_for_status()
+            except HTTPStatusError as exc:
+                last_exc = exc
+                if _fb_http_error_should_propagate(exc):
+                    raise
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in (401, 403):
+                    logger.warning(
+                        "Facebook embedded /me feed forbidden status=%s",
+                        status_code,
+                    )
+                    return []
+                logger.warning(
+                    "Facebook embedded /me feed failed; narrower fields status=%s body=%s",
+                    status_code if status_code is not None else "unknown",
+                    exc.response.text if exc.response is not None else "",
+                )
+                continue
+
+            data = resp.json()
+            feed = data.get("feed")
+            if isinstance(feed, dict):
+                return feed.get("data", []) or []
             return []
-        data = resp.json()
-        feed = data.get("feed")
-        if isinstance(feed, dict):
-            return feed.get("data", []) or []
+
+        if last_exc is not None:
+            logger.warning("Facebook embedded /me feed: exhausted inner field fallbacks")
         return []
 
 
@@ -281,26 +370,20 @@ async def fetch_fb_posts_detailed(token: str, limit: int = 50) -> FacebookPostsF
     """
     Fetch the current user's Facebook posts.
 
-    Tries /me/posts first. If Meta returns subcode 2069030 (New Pages experience / endpoint not
-    supported), falls back to embedded `feed` on /me only (user-flow only).
+    Uses /me/posts with progressive field fallbacks (so video/audio/mixed feeds still load when
+    optional fields fail). If that path never succeeds, tries embedded ``feed`` on ``/me`` (New
+    Pages experience and similar). Auth errors (401/403) still propagate.
     """
-    try:
-        posts = await _fetch_fb_posts_me_posts_edge(token, limit)
-        return FacebookPostsFetchResult(posts=posts, tried_npe_fallback=False)
-    except HTTPStatusError as exc:
-        subcode = _fb_http_error_subcode(exc)
-        if exc.response is not None and exc.response.status_code == 400 and subcode == 2069030:
-            logger.info(
-                "Facebook /me/posts unsupported (error_subcode=2069030); trying NPE-compatible fallbacks"
-            )
-            embedded = await _fetch_fb_posts_me_embedded_feed(token, limit)
-            if embedded:
-                return FacebookPostsFetchResult(posts=embedded[:limit], tried_npe_fallback=True)
-            logger.warning(
-                "Facebook user-flow fallback returned no posts for this account."
-            )
-            return FacebookPostsFetchResult(posts=[], tried_npe_fallback=True)
-        raise
+    posts, ok = await _fetch_fb_posts_me_posts_edge(token, limit)
+    if ok:
+        return FacebookPostsFetchResult(posts=posts[:limit], tried_npe_fallback=False)
+
+    logger.info("Facebook /me/posts unavailable for this token; trying embedded /me feed fallback")
+    embedded = await _fetch_fb_posts_me_embedded_feed(token, limit)
+    if embedded:
+        return FacebookPostsFetchResult(posts=embedded[:limit], tried_npe_fallback=True)
+    logger.warning("Facebook embedded feed returned no posts for this account.")
+    return FacebookPostsFetchResult(posts=[], tried_npe_fallback=True)
 
 
 async def fetch_fb_posts(token: str, limit: int = 50) -> list[dict]:

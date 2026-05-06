@@ -23,8 +23,10 @@ from app.api.reports import router as reports_router
 from app.api.social_posts import router as social_posts_router
 from app.core.config import get_settings
 from app.core.database import initialize_database
+from app.core.logging import RequestLogMiddleware, setup_logging
 from app.services.report_scheduler import start_scheduler, stop_scheduler
 
+setup_logging()
 settings = get_settings()
 _log = logging.getLogger("uvicorn.error")
 
@@ -34,7 +36,10 @@ async def lifespan(app: FastAPI):
     """Log DB mode and SQLite 3 engine version for local file DB."""
     await initialize_database()
     if settings.USE_LOCAL_SQLITE:
-        _log.info("Database: local SQLite 3 file at ./db/app.db (USE_LOCAL_SQLITE=true; DATABASE_URL is ignored).")
+        _log.info(
+            "Database: local SQLite 3 file at %s (USE_LOCAL_SQLITE=true; DATABASE_URL is ignored).",
+            settings.database_url_sync.replace("sqlite:///", "", 1),
+        )
     if settings.database_url_async.startswith("sqlite"):
         import sqlite3
 
@@ -60,6 +65,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLogMiddleware)
 
 app.include_router(api_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")

@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 import httpx
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,33 +25,33 @@ def test_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("IG_APP_ID", "")
     monkeypatch.setenv("IG_APP_SECRET", "")
     monkeypatch.setenv("META_STATE_SECRET", "test-meta-state-secret")
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
 
     from app.core.config import get_settings
+    from app.core.database import reset_database_state
 
     get_settings.cache_clear()
+    import asyncio
+
+    asyncio.run(reset_database_state())
     yield
+    asyncio.run(reset_database_state())
     get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture()
 async def client(test_env):
-    from app.core.database import get_async_engine
-    from app.models.social_connection import SocialConnection
-    from app.models.user import User
+    from app.core.database import initialize_database, get_async_engine
     from app.services import chat_store
     from main import app
 
     chat_store.reset_memory_store()
+    await initialize_database()
     engine = get_async_engine()
     assert engine is not None
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda sync_conn: User.__table__.create(sync_conn, checkfirst=True))
-        await conn.run_sync(lambda sync_conn: SocialConnection.__table__.create(sync_conn, checkfirst=True))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as api_client:
         yield api_client
-
-    await engine.dispose()
 
 
 def test_extract_leaked_tool_calls_strips_markup_and_parses_json():
@@ -303,7 +304,7 @@ async def test_chat_reuses_client_provided_session_uuid(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_dashboard_reports_missing_platform_as_zero(client: AsyncClient):
+async def test_dashboard_reports_missing_platform_as_zero(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
     register_response = await client.post(
         "/api/auth/register",
         json={
@@ -330,6 +331,27 @@ async def test_dashboard_reports_missing_platform_as_zero(client: AsyncClient):
             access_token="token",
             platform_name="Facebook Person",
         )
+
+    from app.services import meta as meta_service
+    from app.services.meta import FacebookPostsFetchResult
+
+    async def _fake_fb_detailed(_token: str, limit: int = 50):  # noqa: ARG001
+        assert limit == 10
+        return FacebookPostsFetchResult(
+            posts=[
+                {
+                    "id": "fb-dash-1",
+                    "message": "Dashboard connectivity check post.",
+                    "created_time": "2026-04-25T12:10:00+0000",
+                    "type": "status",
+                    "likes": {"summary": {"total_count": 0}},
+                    "comments": {"summary": {"total_count": 0}},
+                }
+            ],
+            tried_npe_fallback=False,
+        )
+
+    monkeypatch.setattr(meta_service, "fetch_fb_posts_detailed", _fake_fb_detailed)
 
     dashboard_response = await client.get("/api/dashboard/summary", headers=headers)
     assert dashboard_response.status_code == 200
@@ -650,3 +672,52 @@ async def test_social_posts_facebook_new_pages_experience_returns_empty_success(
     assert payload["posts"] == []
     assert payload["meta"].get("notice")
     assert "new pages experience" in payload["meta"]["notice"].lower()
+
+
+@pytest.mark.asyncio
+async def test_initialize_database_recreates_empty_database_after_file_delete(test_env, tmp_path: Path):
+    db_path = tmp_path / "test.db"
+
+    from app.core.database import get_async_session_factory, initialize_database, reset_database_state
+    from app.models.user import User
+
+    await initialize_database()
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+
+    async with sessionmaker() as db:
+        db.add(
+            User(
+                email="reset@example.com",
+                password_hash="hash",
+                full_name="Reset Tester",
+            )
+        )
+        await db.commit()
+
+    assert db_path.exists()
+
+    await reset_database_state()
+    db_path.unlink()
+    await initialize_database()
+    sessionmaker = get_async_session_factory()
+    assert sessionmaker is not None
+
+    async with sessionmaker() as db:
+        users = (await db.execute(select(User))).scalars().all()
+
+    assert users == []
+
+
+@pytest.mark.asyncio
+async def test_request_logging_is_human_readable(client: AsyncClient, caplog: pytest.LogCaptureFixture):
+    caplog.set_level("INFO", logger="app.http")
+
+    response = await client.get("/api/health")
+
+    assert response.status_code == 200
+    assert any(
+        "HTTP GET /api/health -> 200" in record.getMessage()
+        for record in caplog.records
+        if record.name == "app.http"
+    )

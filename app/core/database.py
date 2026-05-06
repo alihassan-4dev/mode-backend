@@ -40,7 +40,7 @@ def _get_async_engine():
     if not url:
         return None
     if url.startswith("sqlite"):
-        Path("db").mkdir(exist_ok=True)
+        _ensure_sqlite_parent_dir(url)
         return create_async_engine(url, echo=False, connect_args={"check_same_thread": False})
     return create_async_engine(url, echo=False, pool_pre_ping=True)
 
@@ -51,7 +51,7 @@ def _get_sync_engine():
     if not url:
         return None
     if url.startswith("sqlite"):
-        Path("db").mkdir(exist_ok=True)
+        _ensure_sqlite_parent_dir(url)
         return create_engine(url, echo=False, connect_args={"check_same_thread": False})
     return create_engine(url, echo=False, pool_pre_ping=True)
 
@@ -120,12 +120,34 @@ def _migrate_database_to_head() -> None:
 
 _async_engine = None
 _async_session_factory = None
+_async_engine_url = None
+_sync_engine = None
+_sync_engine_url = None
+
+
+def _sqlite_file_path(url: str) -> Path | None:
+    if not url.startswith("sqlite"):
+        return None
+    _, _, path_part = url.partition(":///")
+    if not path_part:
+        return None
+    return Path(path_part).resolve()
+
+
+def _ensure_sqlite_parent_dir(url: str) -> None:
+    db_path = _sqlite_file_path(url)
+    if db_path is not None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_async_engine():
-    global _async_engine
-    if _async_engine is None:
+    global _async_engine, _async_engine_url, _async_session_factory
+    settings = get_settings()
+    url = settings.database_url_async
+    if _async_engine is None or _async_engine_url != url:
         _async_engine = _get_async_engine()
+        _async_engine_url = url
+        _async_session_factory = None
     return _async_engine
 
 
@@ -137,6 +159,31 @@ def get_async_session_factory():
             return None
         _async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return _async_session_factory
+
+
+def get_sync_engine():
+    global _sync_engine, _sync_engine_url
+    settings = get_settings()
+    url = settings.database_url_sync
+    if _sync_engine is None or _sync_engine_url != url:
+        _sync_engine = _get_sync_engine()
+        _sync_engine_url = url
+    return _sync_engine
+
+
+async def reset_database_state() -> None:
+    global _async_engine, _async_engine_url, _async_session_factory, _sync_engine, _sync_engine_url
+
+    if _async_engine is not None:
+        await _async_engine.dispose()
+    if _sync_engine is not None:
+        _sync_engine.dispose()
+
+    _async_engine = None
+    _async_engine_url = None
+    _async_session_factory = None
+    _sync_engine = None
+    _sync_engine_url = None
 
 
 async def get_db() -> AsyncSession:
@@ -152,4 +199,11 @@ async def get_db() -> AsyncSession:
 
 async def initialize_database() -> None:
     """Apply required schema migrations when the app starts."""
+    settings = get_settings()
+    db_path = _sqlite_file_path(settings.database_url_async)
+    db_file_existed = db_path.exists() if db_path is not None else None
     await asyncio.to_thread(_migrate_database_to_head)
+    if db_path is not None:
+        state = "created fresh" if db_file_existed is False else "ready"
+        logger.info("Database %s at %s", state, db_path)
+    logger.info("Database schema initialized for %d tables.", len(Base.metadata.sorted_tables))

@@ -1,10 +1,13 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_SQLITE_PATH = BACKEND_ROOT / "db" / "app.db"
 # Default local SQLite 3 file (no configuration required when USE_LOCAL_SQLITE=true).
-LOCAL_SQLITE_ASYNC_URL = "sqlite+aiosqlite:///./db/app.db"
-LOCAL_SQLITE_SYNC_URL = "sqlite:///./db/app.db"
+LOCAL_SQLITE_ASYNC_URL = f"sqlite+aiosqlite:///{LOCAL_SQLITE_PATH.as_posix()}"
+LOCAL_SQLITE_SYNC_URL = f"sqlite:///{LOCAL_SQLITE_PATH.as_posix()}"
 
 
 class Settings(BaseSettings):
@@ -56,6 +59,7 @@ class Settings(BaseSettings):
     REPORTS_REFRESH_MINUTES: int = 5
     # Max posts per platform fetched and analyzed per refresh cycle.
     REPORTS_POSTS_PER_PLATFORM: int = 10
+    LOG_LEVEL: str = "INFO"
 
     model_config = SettingsConfigDict(
         env_file=".env",
